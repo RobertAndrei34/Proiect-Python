@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+
+# ----------------------------
+# Color helpers
+# ----------------------------
+ANSI_RESET = "\x1b[0m"
+ANSI_DIM = "\x1b[2m"
+ANSI_RED = "\x1b[31m"
+ANSI_GREEN = "\x1b[32m"
+ANSI_YELLOW = "\x1b[33m"
+ANSI_CYAN = "\x1b[36m"
+
+
+def supports_color(stream) -> bool:
+    return hasattr(stream, "isatty") and stream.isatty()
+
+
+def colorize(s: str, color: str, enabled: bool) -> str:
+    if not enabled:
+        return s
+    return f"{color}{s}{ANSI_RESET}"
+
+
+def highlight_regex(line: str, rx: re.Pattern, enabled: bool) -> str:
+    if not enabled:
+        return line
+
+    # Avoid huge slowdowns for pathological regex: highlight only first match per line.
+    m = rx.search(line)
+    if not m:
+        return line
+
+    a, b = m.span()
+    return line[:a] + ANSI_YELLOW + line[a:b] + ANSI_RESET + line[b:]
+
+
+# ----------------------------
+# Grep core
+# ----------------------------
+def is_probably_text_file(path: Path, sample_size: int = 4096) -> bool:
+    try:
+        with path.open("rb") as f:
+            chunk = f.read(sample_size)
+        return b"\x00" not in chunk
+    except OSError:
+        return False
+
+
+def iter_files(inputs: list[Path], recursive: bool) -> Iterator[Path]:
+    for p in inputs:
+        if p.is_file():
+            yield p
+        elif p.is_dir():
+            if recursive:
+                for fp in p.rglob("*"):
+                    if fp.is_file():
+                        yield fp
+            else:
+                for fp in p.glob("*"):
+                    if fp.is_file():
+                        yield fp
+
+
+@dataclass
+class Stats:
+    files_seen: int = 0
+    files_read: int = 0
+    files_skipped_binary: int = 0
+    lines_seen: int = 0
+    lines_reported: int = 0
+    elapsed_s: float = 0.0
+
+
+def grep_file(
+    filepath: Path,
+    rx: re.Pattern,
+    invert: bool,
+    count_only: bool,
+    color_enabled: bool,
+    logger: logging.Logger,
+    stats: Stats,
+) -> None:
+    stats.files_seen += 1
+
+    if not is_probably_text_file(filepath):
+        stats.files_skipped_binary += 1
+        logger.debug("Skipping binary file: %s", filepath)
+        return
+
+    try:
+        with filepath.open("r", encoding="utf-8", errors="replace") as f:
+            stats.files_read += 1
+            match_count = 0
+            for lineno, raw in enumerate(f, start=1):
+                stats.lines_seen += 1
+                line = raw.rstrip("\n")
+
+                matched = rx.search(line) is not None
+                ok = (not matched) if invert else matched
+
+                if ok:
+                    if count_only:
+                        match_count += 1
+                    else:
+                        # Output: file:line:content (with optional highlighting)
+                        shown = line
+                        if (not invert) and color_enabled:
+                            shown = highlight_regex(shown, rx, enabled=True)
+
+                        # Make "file:lineno:" dim, content normal/highlighted
+                        prefix = f"{filepath}:{lineno}:"
+                        prefix = colorize(prefix, ANSI_DIM, color_enabled)
+                        print(f"{prefix}{shown}")
+                        stats.lines_reported += 1
+
+            if count_only:
+                # Output: file:count
+                prefix = colorize(f"{filepath}:", ANSI_DIM, color_enabled)
+                print(f"{prefix}{match_count}")
+                stats.lines_reported += 1
+
+    except OSError as ex:
+        logger.error("Cannot read '%s': %s", filepath, ex)
+
+
+# ----------------------------
+# CLI
+# ----------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="grep.py",
+        description="Lightweight grep-like utility (regex search) for files/folders.",
+    )
+    p.add_argument("regex", help="Regular expression pattern (Python re).")
+    p.add_argument(
+        "inputs",
+        nargs="+",
+        help="One or more files/folders to search.",
+    )
+
+    p.add_argument("-r", "--recursive", action="store_true", help="Recurse into folders.")
+    p.add_argument("-i", "--ignore-case", action="store_true", help="Case-insensitive search.")
+    p.add_argument("-v", "--not", dest="invert", action="store_true", help="Invert match (show non-matching lines).")
+    p.add_argument("-c", "--count", action="store_true", help="Print count per file (one line per file).")
+
+    p.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Colored output/highlighting (default: auto).",
+    )
+    p.add_argument(
+        "--log",
+        default=None,
+        help="Write logs to a file (errors, debug if enabled).",
+    )
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging (more verbose).",
+    )
+    p.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print performance metrics to stderr at the end.",
+    )
+    return p
+
+
+def setup_logging(log_path: Optional[str], debug: bool) -> logging.Logger:
+    logger = logging.getLogger("grep")
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+
+    # Clear handlers if script is re-run in same interpreter session
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setLevel(logging.DEBUG if debug else logging.WARNING)  # keep console clean by default
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    if log_path:
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setLevel(logging.DEBUG if debug else logging.INFO)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+
+    return logger
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    logger = setup_logging(args.log, args.debug)
+
+    # Decide color mode
+    if args.color == "always":
+        color_enabled = True
+    elif args.color == "never":
+        color_enabled = False
+    else:
+        color_enabled = supports_color(sys.stdout)
+
+    flags = re.IGNORECASE if args.ignore_case else 0
+    try:
+        rx = re.compile(args.regex, flags)
+    except re.error as ex:
+        msg = f"Invalid regex: {ex}"
+        print(colorize(msg, ANSI_RED, color_enabled), file=sys.stderr)
+        return 2
+
+    inputs = [Path(s) for s in args.inputs]
+    missing = [str(p) for p in inputs if not p.exists()]
+    if missing:
+        for m in missing:
+            logger.error("Path not found: %s", m)
+        print(colorize(f"Error: {len(missing)} input path(s) not found.", ANSI_RED, color_enabled), file=sys.stderr)
+        return 2
+
+    stats = Stats()
+    t0 = time.perf_counter()
+
+    try:
+        for fp in iter_files(inputs, recursive=args.recursive):
+            grep_file(
+                filepath=fp,
+                rx=rx,
+                invert=args.invert,
+                count_only=args.count,
+                color_enabled=color_enabled,
+                logger=logger,
+                stats=stats,
+            )
+    except KeyboardInterrupt:
+        print(colorize("Interrupted.", ANSI_RED, color_enabled), file=sys.stderr)
+        return 130
+    finally:
+        stats.elapsed_s = time.perf_counter() - t0
+
+        if args.stats:
+            # Stats to stderr (so piping output still works)
+            line = (
+                f"Stats: files_seen={stats.files_seen}, files_read={stats.files_read}, "
+                f"skipped_binary={stats.files_skipped_binary}, lines_seen={stats.lines_seen}, "
+                f"lines_reported={stats.lines_reported}, elapsed={stats.elapsed_s:.4f}s"
+            )
+            print(colorize(line, ANSI_CYAN, color_enabled), file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
